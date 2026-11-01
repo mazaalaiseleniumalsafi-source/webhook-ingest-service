@@ -1,0 +1,104 @@
+name: Webhook Security Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  webhook-security-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start webhook service in background
+        run: |
+          WEBHOOK_SECRET=ci-test-signing-secret PORT=3000 node server.js &
+          sleep 2
+
+      - name: Test forged signature rejection (HTTP 401)
+        run: |
+          FORGED_PAYLOAD='{"event":"payment.succeeded","amount":5000}'
+          FORGED_SIG="invalid_forged_signature_hex_1234567890abcdef"
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/webhooks/payment \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Signature: $FORGED_SIG" \
+            -d "$FORGED_PAYLOAD")
+
+          echo "Forged signature test response HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "401" ]; then
+            echo "Security check failed: Expected HTTP 401 for forged signature, got $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Test valid HMAC-SHA256 signature verification (HTTP 200)
+        run: |
+          PAYLOAD='{"event":"payment.succeeded","amount":5000}'
+          SECRET="ci-test-signing-secret"
+
+          VALID_SIG=$(node -e "
+            const crypto = require('crypto');
+            process.stdout.write(crypto.createHmac('sha256', '$SECRET').update('$PAYLOAD').digest('hex'));
+          ")
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST http://localhost:3000/api/webhooks/payment \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Signature: $VALID_SIG" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Valid signature test response HTTP status: $HTTP_CODE"
+          echo "Response body: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Verification check failed: Expected HTTP 200 for valid signature, got $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "$BODY" | grep -q '"verified":true'
+          echo "$BODY" | grep -q '"event":"payment.succeeded"'
+
+      - name: Generate audit report
+        run: |
+          node -e "
+            const fs = require('fs');
+            const report = {
+              service: 'webhook-ingest-service',
+              gate: 'Automated Webhook HMAC Signature & Tamper-Resistance CI/CD Gate',
+              timestamp: new Date().toISOString(),
+              checks: {
+                forged_signature_rejection: {
+                  expected_status: 401,
+                  status: 'PASSED'
+                },
+                valid_hmac_sha256_verification: {
+                  expected_status: 200,
+                  status: 'PASSED'
+                }
+              },
+              overall_status: 'PASSED'
+            };
+            fs.writeFileSync('webhook-audit-report.json', JSON.stringify(report, null, 2));
+          "
+          cat webhook-audit-report.json
+
+      - name: Upload webhook audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: webhook-audit-report
+          path: webhook-audit-report.json
